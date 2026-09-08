@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<!--
+  电力现货市场出清仿真平台 —— 单页应用入口
+  依赖脚本（按顺序加载）：
+    1. vendor/vue.global.prod.js   —— Vue 3 全局构建（含模板编译器）
+    2. vendor/echarts.min.js       —— ECharts 5 图表库
+    3. js/engine.js                —— 出清算法内核（MarketEngine）
+    4. js/store.js                 —— 数据模型 / 场景 / 持久化（MarketStore）
+    5. js/app.js                   —— Vue 界面组件 + 挂载入口
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>电力现货市场出清仿真平台</title>
+<style>
+  /* ============================================================ */
+  /*  设计令牌（CSS 变量）：主题色 / 边距 / 圆角集中管理            */
+  /* ============================================================ */
+  :root{
+    --bg:#f1f5f9; --card:#ffffff; --line:#e2e8f0; --line-strong:#cbd5e1;
+    --ink:#0f172a; --ink-2:#475569; --ink-3:#94a3b8;
+    --brand:#2563eb; --brand-soft:#eff6ff;
+    --gen:#2563eb; --con:#d97706;
+    --ok:#059669; --ok-soft:#ecfdf5;
+    --warn:#d97706; --warn-soft:#fffbeb;
+    --bad:#dc2626; --bad-soft:#fef2f2;
+    --side:#0f172a; --side-2:#1e293b; --side-ink:#cbd5e1;
+    --r:10px; --r-sm:6px;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;margin:0;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+    font-size:14px; line-height:1.55; color:var(--ink); background:var(--bg);
+    -webkit-font-smoothing:antialiased;   /* 关闭 WebKit 字体锯齿补偿，避免部分 Chrome 加粗 */
+  }
+  h1,h2,h3,h4{margin:0;font-weight:600;}
+  button{font-family:inherit;font-size:13px;cursor:pointer;}
+
+  /* ============================================================ */
+  /*  布局：左侧深色侧栏 + 右侧主区（顶栏 + 内容）                  */
+  /* ============================================================ */
+  .app{display:flex;min-height:100vh;}
+  .sidebar{
+    width:216px;flex:0 0 216px;background:var(--side);color:var(--side-ink);
+    display:flex;flex-direction:column;position:sticky;top:0;height:100vh;
+  }
+  .brand{padding:20px 18px 16px;border-bottom:1px solid rgba(255,255,255,.08);}
+  .brand-title{font-size:14px;font-weight:600;color:#fff;letter-spacing:.02em;}
+  .brand-sub{font-size:11px;color:#64748b;margin-top:3px;}
+  .nav{padding:10px 8px;flex:1;overflow-y:auto;}
+  .nav-group{font-size:10px;color:#475569;padding:10px 10px 6px;letter-spacing:.08em;}
+  .nav-item{
+    display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--r-sm);
+    color:var(--side-ink);font-size:13px;cursor:pointer;margin-bottom:2px;
+    border-left:2px solid transparent;transition:background .12s;
+  }
+  .nav-item:hover{background:var(--side-2);color:#fff;}
+  .nav-item.active{background:var(--side-2);color:#fff;border-left-color:var(--brand);font-weight:500;}
+  .nav-dot{width:6px;height:6px;border-radius:50%;background:#475569;flex:0 0 6px;}
+  .nav-item.active .nav-dot{background:var(--brand);}
+  .side-foot{padding:12px 16px;font-size:11px;color:#475569;border-top:1px solid rgba(255,255,255,.08);}
+
+  .main{flex:1;min-width:0;display:flex;flex-direction:column;}
+  .topbar{
+    background:#fff;border-bottom:1px solid var(--line);padding:11px 22px;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;position:sticky;top:0;z-index:20;
+  }
+  .content{padding:20px 22px 40px;flex:1;}
+
+  /* ============================================================ */
+  /*  顶栏控件：时段切换 / 开关 / 状态徽章 / 主按钮                  */
+  /* ============================================================ */
+  .period-box{display:flex;align-items:center;gap:10px;}
+  .period-time{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;min-width:60px;}
+  .period-idx{font-size:11px;color:var(--ink-3);}
+  input[type=range]{width:190px;accent-color:var(--brand);}
+  .btn{
+    border:1px solid var(--line-strong);background:#fff;color:var(--ink-2);
+    padding:6px 13px;border-radius:var(--r-sm);transition:all .12s;
+  }
+  .btn:hover{border-color:var(--brand);color:var(--brand);}
+  .btn-primary{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:500;}
+  .btn-primary:hover{background:#1d4ed8;border-color:#1d4ed8;color:#fff;}
+  .btn-sm{padding:3px 9px;font-size:12px;}
+  .btn-ghost{border-color:transparent;background:transparent;}
+  .btn-ghost:hover{background:var(--bg);}
+  .btn:disabled{opacity:.5;cursor:not-allowed;}
+  .topbar-spacer{flex:1;}
+
+  .switch{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--ink-2);cursor:pointer;user-select:none;}
+  .switch input{accent-color:var(--brand);width:15px;height:15px;cursor:pointer;}
+
+  /* 状态徽章 pill：4 种色调（ok/warn/bad/info/mute）                  */
+  .pill{
+    display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:20px;
+    font-size:11px;font-weight:500;
+  }
+  .pill-ok{background:var(--ok-soft);color:var(--ok);}
+  .pill-warn{background:var(--warn-soft);color:var(--warn);}
+  .pill-bad{background:var(--bad-soft);color:var(--bad);}
+  .pill-info{background:var(--brand-soft);color:var(--brand);}
+  .pill-mute{background:#f1f5f9;color:var(--ink-3);}
+
+  /* ============================================================ */
+  /*  卡片 / 网格 / KPI                                              */
+  /* ============================================================ */
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);margin-bottom:16px;}
+  .card-head{
+    padding:13px 18px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  }
+  .card-title{font-size:14px;font-weight:600;}
+  .card-desc{font-size:12px;color:var(--ink-3);font-weight:400;}
+  .card-body{padding:16px 18px;}
+  .card-body.tight{padding:0;}
+  .head-actions{margin-left:auto;display:flex;gap:8px;align-items:center;}
+
+  .grid{display:grid;gap:16px;}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr));}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr));}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));}
+
+  /* KPI 卡片：左侧 3px 色条区分类别（accent / ok / warn / bad）        */
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;}
+  .kpi-label{font-size:11px;color:var(--ink-3);letter-spacing:.02em;}
+  .kpi-value{font-size:25px;font-weight:600;margin-top:5px;font-variant-numeric:tabular-nums;line-height:1.15;}
+  .kpi-unit{font-size:12px;font-weight:400;color:var(--ink-3);margin-left:3px;}
+  .kpi-note{font-size:11px;color:var(--ink-3);margin-top:3px;}
+  .kpi.accent{border-left:3px solid var(--brand);}
+  .kpi.ok{border-left:3px solid var(--ok);}
+  .kpi.warn{border-left:3px solid var(--warn);}
+  .kpi.bad{border-left:3px solid var(--bad);}
+
+  /* ============================================================ */
+  /*  表格：通用样式 + 数字右对齐 + 等宽字体                          */
+  /* ============================================================ */
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th{
+    text-align:left;font-weight:500;color:var(--ink-3);font-size:11px;letter-spacing:.03em;
+    padding:8px 12px;border-bottom:1px solid var(--line);background:#f8fafc;white-space:nowrap;
+  }
+  td{padding:8px 12px;border-bottom:1px solid #f1f5f9;font-variant-numeric:tabular-nums;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover{background:#f8fafc;}
+  .num{text-align:right;}
+  .mono{font-variant-numeric:tabular-nums;}
+  tfoot td{font-weight:600;background:#f8fafc;border-top:1px solid var(--line);}
+  .tbl-scroll{overflow-x:auto;}
+
+  /* ============================================================ */
+  /*  表单：输入框 / 下拉 / 数字框                                    */
+  /* ============================================================ */
+  .field{display:flex;flex-direction:column;gap:4px;}
+  .field-label{font-size:11px;color:var(--ink-3);}
+  input[type=text],input[type=number],select{
+    border:1px solid var(--line-strong);border-radius:var(--r-sm);padding:5px 9px;
+    font-size:13px;font-family:inherit;color:var(--ink);background:#fff;width:100%;
+    font-variant-numeric:tabular-nums;
+  }
+  input:focus,select:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(37,99,235,.1);}
+  input[type=number]{text-align:right;}
+  .inp-sm{padding:3px 7px;font-size:12px;}
+
+  /* ============================================================ */
+  /*  主体列表 / 报价段 / 进度条                                      */
+  /* ============================================================ */
+  .plist{display:flex;flex-direction:column;gap:6px;}
+  .prow{
+    display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--r-sm);
+    border:1px solid var(--line);background:#fff;cursor:pointer;transition:all .12s;
+  }
+  .prow:hover{border-color:var(--line-strong);}
+  .prow.active{border-color:var(--brand);background:var(--brand-soft);}
+  .prow.off{opacity:.45;}                              /* 停用主体半透明 */
+  .pdot{width:8px;height:8px;border-radius:2px;flex:0 0 8px;}
+  .pname{font-size:13px;font-weight:500;}
+  .pmeta{font-size:11px;color:var(--ink-3);}
+  .prow-right{margin-left:auto;text-align:right;}
+  .pbid{font-size:11px;color:var(--ink-2);font-variant-numeric:tabular-nums;}
+
+  /* 图表容器高度档位：默认 320px，sm=240px，lg=400px                   */
+  .chart{width:100%;height:320px;}
+  .chart-sm{height:240px;}
+  .chart-lg{height:400px;}
+
+  /* ============================================================ */
+  /*  分段控件 / 警示框 / 图例 / 标签                                 */
+  /* ============================================================ */
+  .seg-ctl{display:inline-flex;border:1px solid var(--line-strong);border-radius:var(--r-sm);overflow:hidden;}
+  .seg-ctl button{
+    border:none;background:#fff;padding:5px 13px;color:var(--ink-2);font-size:12px;
+    border-right:1px solid var(--line);
+  }
+  .seg-ctl button:last-child{border-right:none;}
+  .seg-ctl button.on{background:var(--brand);color:#fff;font-weight:500;}
+
+  .empty{padding:36px 18px;text-align:center;color:var(--ink-3);font-size:13px;}
+  .note{font-size:12px;color:var(--ink-3);line-height:1.7;}
+  /* 等宽块：用于展示"算法说明"等长文本                                */
+  .mono-block{
+    font-family:ui-monospace,"Cascadia Mono",Consolas,monospace;font-size:12px;
+    background:#f8fafc;border:1px solid var(--line);border-radius:var(--r-sm);
+    padding:11px 13px;white-space:pre-wrap;line-height:1.65;color:var(--ink-2);
+  }
+  .alert{padding:10px 13px;border-radius:var(--r-sm);font-size:12.5px;margin-bottom:10px;}
+  .alert-warn{background:var(--warn-soft);color:#92400e;border:1px solid #fde68a;}
+  .alert-bad{background:var(--bad-soft);color:#991b1b;border:1px solid #fecaca;}
+  .alert-ok{background:var(--ok-soft);color:#065f46;border:1px solid #a7f3d0;}
+  .alert-info{background:var(--brand-soft);color:#1e40af;border:1px solid #bfdbfe;}
+
+  /* 一致性校验清单行：左侧圆形勾叉图标 + 名称 + 详情                  */
+  .check-row{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid #f1f5f9;font-size:13px;}
+  .check-row:last-child{border-bottom:none;}
+  .check-mark{width:17px;height:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 17px;font-size:11px;color:#fff;}
+  .check-mark.ok{background:var(--ok);}
+  .check-mark.bad{background:var(--bad);}
+  .check-mark.warn{background:var(--warn);}
+
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:var(--ink-2);margin-bottom:8px;}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle;}
+
+  /* 容量条 / 进度条：用于"线路负载率"等可视化                        */
+  .bar-track{height:7px;background:#f1f5f9;border-radius:4px;overflow:hidden;position:relative;}
+  .bar-fill{height:100%;border-radius:4px;}
+
+  /* 角色标签：发电蓝 / 用电橙                                       */
+  .tag{font-size:10px;padding:1px 6px;border-radius:3px;background:#f1f5f9;color:var(--ink-3);font-weight:500;}
+  .tag-gen{background:var(--brand-soft);color:var(--brand);}
+  .tag-con{background:var(--warn-soft);color:var(--warn);}
+
+  .page-head{margin-bottom:16px;}
+  .page-title{font-size:19px;font-weight:600;}
+  .page-sub{font-size:12.5px;color:var(--ink-3);margin-top:3px;}
+
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
+  .col{display:flex;flex-direction:column;gap:10px;}
+
+  .file-input{display:none;}                            /* 隐藏原生 file input，由按钮代理点击 */
+
+  /* ============================================================ */
+  /*  响应式：≤900px 时侧栏折叠为图标栏                                */
+  /* ============================================================ */
+  @media (max-width:900px){
+    .sidebar{width:60px;flex:0 0 60px;}
+    .brand-title,.brand-sub,.nav-group,.side-foot,.nav-item span{display:none;}
+    .nav-item{justify-content:center;}
+    .content{padding:14px;}
+  }
+</style>
+</head>
+<body>
+<!-- Vue 挂载点：app.js 末尾 createApp(...).mount('#app') 把组件树挂载到这里 -->
+<div id="app"></div>
+
+<script src="vendor/vue.global.prod.js"></script>
+<script src="vendor/echarts.min.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/store.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
