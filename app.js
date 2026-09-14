@@ -2,71 +2,99 @@
  * 电力现货市场出清仿真平台 —— 界面与交互
  * Vue 3（全局构建，含模板编译器）+ ECharts 5，全部本地化，断网可用。
  *
- * 文件结构：
- *   1. 工具与格式化函数（nf / n0 / n1 / money / pct / nodeColor / useChart）
- *   2. App 根组件 —— 状态容器、出清调度、派生量、持久化
- *   3. 7 个子页面 —— Overview / Bid / Curve / Price / Settle / Network / Data
- *   4. createApp().component(...).mount('#app') 入口挂载
+ * ── 给学过 C++ 的同学的阅读地图 ──────────────────────────────
+ * 本文件约等于 main.cpp + 一组“控件类” + 图表库封装。核心套路：
  *
- * 关键约定：
- *   - 时段索引 period ∈ [0, 95]，对应 00:00 → 23:45，间隔 15 分钟
- *   - 报价数据按"主体 × 时段"二维存放在 state.participants[i].bids[j]
- *   - 出清结果一次性算完 96 个时段，存到 shallowRef(results.value)，再分页渲染
+ *   1) 页面组件（OverviewPage / BidPage / …）≈ 一个 C++ 类：
+ *        setup()   ≈ 构造函数，把成员初始化好并交给模板使用；
+ *        data()    ≈ 不需要响应式的普通成员变量；
+ *        computed  ≈ 带缓存的 getter：被依赖的数据变了才重算，否则直接返回上次结果；
+ *        methods   ≈ 普通成员函数；
+ *        template  ≈ 这个类的界面布局声明（类似 Qt Designer 的 .ui，但直接写成字符串）。
+ *
+ *   2) reactive / ref ≈ “带通知的成员变量容器”：
+ *        修改容器的内容 → Vue 自动找到模板里用到它的地方并重画，无需手动刷新界面。
+ *        这就是 C++ 里常见的“命令式写 UI”与这里“声明式 UI”的本质区别。
+ *
+ *   3) 模板指令：v-model = 双向绑定、@click = 事件回调（类似 connect(signal)）、
+ *        v-for = 循环生成一批界面、v-if / v-else = 按条件显示、{{ }} 里写表达式。
+ *
+ *   4) useChart ≈ RAII 封装：创建 ECharts 实例 → 数据一变自动刷新 → 组件销毁时释放。
+ *
+ *   5) MarketEngine（engine.js）与 MarketStore（store.js）是两个纯逻辑“库”，
+ *        本文件只调用它们拿结果、展示结果，不重写算法。
  * ========================================================================= */
 (function () {
   'use strict';
 
+  // Vue 全局对象来自 index.html 里先加载的 <script src="vendor/vue.global.prod.js">。
+  // 这里从里面“拆包”需要的 API —— 没有 import 机制时，脚本加载顺序就相当于 C++ 的
+  // “链接顺序”：谁先被加载，谁就提供全局对象，顺序反了这里就会拿到 undefined。
   const { createApp, reactive, ref, shallowRef, computed, watch, provide, inject,
     onMounted, onBeforeUnmount, nextTick } = Vue;
-  const E = window.MarketEngine;   // 出清算法内核
-  const S = window.MarketStore;    // 数据模型 / 场景 / 持久化
+
+  // 两个纯逻辑库的“句柄”，作用类似调用 engine::runPeriod(...) 与 store::save(...)：
+  //   E —— 出清与 PTDF/LMP 计算内核（engine.js），没有任何界面代码，可独立单测；
+  //   S —— 数据模型、默认场景、localStorage 持久化、JSON/CSV 导出（store.js）。
+  const E = window.MarketEngine;
+  const S = window.MarketStore;
 
   /* ------------------------------------------------------------ 格式化 */
-  // 数值显示：null / undefined / NaN 统一渲染为破折号，避免表格里出现 "NaN"
+  // 数字 → 字符串的统一出口：界面里所有 {{ }} 都经这些函数，保证
+  // “无数据”显示 —、金额千分位、百分比保留 1 位小数。
+  // 类似 C++ 里的一组 formatXXX() 帮助函数，避免每处都手写 setprecision/千分位。
   const nf = (v, d) => (v === null || v === undefined || !isFinite(v)) ? '—' : Number(v).toFixed(d === undefined ? 2 : d);
-  const n0 = v => nf(v, 0);   // 整数显示（MW、节点数等）
-  const n1 = v => nf(v, 1);   // 一位小数
+  const n0 = v => nf(v, 0);
+  const n1 = v => nf(v, 1);
   const money = v => (v === null || v === undefined || !isFinite(v)) ? '—'
-    : Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 });  // 千分位 + 整数
-  const pct = v => nf(v * 100, 1) + '%';   // 0~1 → "xx.x%"
+    : Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+  const pct = v => nf(v * 100, 1) + '%';
 
-  // 配色：节点色按节点下标循环，方便区分；发电蓝 / 用电橙 与出清红线为系统主色
+  // 全平台统一调色板（C ≈ Color/Chart 常量表）：网络、柱状图、折线图都从这里取色。
   const C = {
     supply: '#2563eb', demand: '#d97706', clear: '#dc2626',
     energy: '#94a3b8', cong: '#dc2626',
     node: ['#2563eb', '#d97706', '#059669', '#7c3aed', '#0891b2'],
     gen: '#2563eb', con: '#d97706', grid: '#f1f5f9', axis: '#94a3b8',
   };
-  // 给定节点 id 返回其固定配色（节点排序决定颜色，因此稳定）
+  // 节点 id → 颜色：按节点在 network.nodes 里的下标轮流取色，所有图表颜色一致。
   const nodeColor = (state, id) => {
     const i = (state.network.nodes || []).findIndex(n => n.id === id);
     return C.node[(i < 0 ? 0 : i) % C.node.length];
   };
 
   /* ------------------------------------------------------------ 图表封装 */
-  // ECharts 响应式封装：传入"返回配置"的 getter，数据变化时自动 setOption
+  // useChart(optGetter)：把“生成图表配置”这件事封装成一张自动管理生命周期的图表。
+  // 用 C++ 类比，它很像一个 RAII 包装类：
+  //   optGetter    —— 每次重画时调用的回调，返回描述这张图的配置对象（≈ 填充好的 option 结构体）；
+  //   echarts.init —— 创建图表实例并绑定到模板里某个 <div ref="xxxChartEl">（≈ new ECharts）；
+  //   watch(...)   —— 监听回调用到的数据，一变就自动重画（≈ 数据源 setter 里发信号）；
+  //   onBeforeUnmount —— 组件销毁前统一释放：去掉窗口 resize 监听 + chart.dispose()（≈ 析构函数）。
+  // 返回 { el, render }，其中 el 是响应式 DOM 引用，模板里写 ref="xxxChartEl" 即完成对接。
   function useChart(optGetter) {
-    const el = ref(null);
-    let chart = null;
+    const el = ref(null);     // 模板里 <div ref="xxxChartEl"> 对应的真实 DOM 节点
+    let chart = null;         // ECharts 实例（懒创建：第一次渲染时才 init）
     const render = () => {
-      if (!el.value) return;
+      if (!el.value) return;  // 模板还没挂载好，先跳过
       let opt;
-      try { opt = optGetter(); } catch (e) { return; }   // 数据尚未就绪时静默忽略
+      try { opt = optGetter(); } catch (e) { return; } // 数据不完整就静默放弃，避免刷红报错
       if (!opt) return;
-      if (!chart) chart = echarts.init(el.value);
-      chart.setOption(opt, true);   // 第二参数 true 表示完整替换
+      if (!chart) chart = echarts.init(el.value);      // 第一次：把图表“new”到该 div 上
+      chart.setOption(opt, true);                      // 之后：整体替换配置并重画（notMerge）
     };
-    const onR = () => { if (chart) chart.resize(); };
+    const onR = () => { if (chart) chart.resize(); };  // 浏览器窗口拉伸时图表跟着自适应
     onMounted(() => { nextTick(render); window.addEventListener('resize', onR); });
     onBeforeUnmount(() => {
       window.removeEventListener('resize', onR);
-      if (chart) { chart.dispose(); chart = null; }   // 必须 dispose，否则 ECharts 实例会泄漏
+      if (chart) { chart.dispose(); chart = null; }    // 释放图表占用的资源（≈ 析构）
     });
+    // flush: 'post' = 等本轮 DOM 更新完再画图，避免图表按旧的容器尺寸渲染
     watch(optGetter, () => nextTick(render), { flush: 'post' });
     return { el, render };
   }
 
-  // 图表通用边距与坐标轴样式（避免每个图表重复写）
+  // 三个“公共样式常量”≈ C++ 里的共享配置结构体；使用时用 {...baseGrid, top: 44}
+  // 复制一份再覆盖个别字段（类似结构体拷贝后改成员），保证不改动全局常量。
   const baseGrid = { left: 56, right: 22, top: 34, bottom: 40 };
   const axisStyle = {
     axisLine: { lineStyle: { color: '#e2e8f0' } },
@@ -79,33 +107,44 @@
     padding: [8, 11],
   };
 
-  // provide/inject 的 key：避免与第三方组件命名冲突，用 Symbol 隔离
+  // 共享上下文（provide/inject）的“钥匙”：Symbol 保证它是全局唯一的标识，不会撞名。
+  // 根组件 App 在 setup() 末尾 provide(CTX, ctx) 把自己“借出去”，
+  // 任意后代页面组件都能用 useCtx()（即 inject(CTX)）取回同一个 ctx ——
+  // 相当于给所有子控件传同一个全局句柄，省去一层层手动传参（依赖注入）。
   const CTX = Symbol('market-ctx');
 
   /* ==================================================================== */
   /*                              主应用                                   */
   /* ==================================================================== */
-  // App 是全局状态容器：负责装载 localStorage、调度一次 run() 出清 96 时段，
-  // 并把 state / results / period / summary 等通过 provide 暴露给各页面。
   const App = {
     setup() {
+      // —— 应用启动：相当于 main() 的开头 ——
+      // 先尝试从浏览器 localStorage 恢复上次存档（S.load()），
+      // 没有存档就调用 S.createDefaultState() 生成默认场景对象。
+      // reactive(...) 把 state 变成“深度响应式”：以后任何深层的修改
+      // （比如 network.lines[0].cap = 100）都会被 Vue 观察到并触发重画/自动保存。
       let loaded = S.load();
       const state = reactive(loaded || S.createDefaultState());
-      const results = shallowRef([]);     // shallowRef 即可：内部对象不需要深度响应
-      const period = ref(78);             // 默认停在 19:30 时段，晚高峰电价最显眼
-      const page = ref('overview');       // 当前页面 key
-      const running = ref(false);         // 跑出清时禁用按钮
-      const dirty = ref(true);            // 数据被改动后置 true，提示保存
-      const lastRun = ref(null);          // 最近一次出清时间，用于角标显示
-      const toast = ref('');              // 右下角轻提示
+      // results 是一整份 96 时段的结果数组，内容大且只会整体替换，
+      // 不需要逐字段监听 → 用 shallowRef（浅响应）省掉不必要的开销。
+      const results = shallowRef([]);
+      // ref(...) 是单个值的响应式容器：模板里直接写 period，JS 里要读写 .value。
+      const period = ref(78);          // 默认停在 19:30 晚高峰
+      const page = ref('overview');    // 当前显示哪个页面（导航状态）
+      const running = ref(false);      // 是否正在出清（用来禁用按钮 / 切换按钮文字）
+      const dirty = ref(true);         // “数据已修改、尚未重新出清”的脏标记
+      const lastRun = ref(null);       // 上次出清完成时间
+      const toast = ref('');           // 右下角临时提示条的文字
 
       /* -------- 出清 -------- */
-      // 把 Vue 响应式 state 深拷贝为纯对象再传给计算内核，避免 Vue Proxy 进入引擎
       function snapshot() {
+        // 把界面里的“活数据”深拷贝成纯对象再交给引擎。
+        // 原因：state 是 Vue 的 reactive 代理，直接传进去会把代理对象带进算法内核，
+        // JSON 序列化相当于做一次彻底的“值拷贝”，保证引擎拿到的只是普通 struct。
         const net = JSON.parse(JSON.stringify(state.network));
         const list = [];
         for (const p of state.participants) {
-          if (p.enabled === false) continue;   // 停用主体不出现在快照里
+          if (p.enabled === false) continue;
           list.push({
             id: p.id, name: p.name, side: p.side, node: p.node,
             bidMode: p.bidMode, segments: p.segments, quad: p.quad,
@@ -115,13 +154,14 @@
         return { net, list };
       }
 
-      // 一次性跑完 96 时段出清，结果按时段顺序写入 results
+      // 执行全日出清：循环 96 个时段，逐段调用引擎 E.runPeriod(...)，收集结果。
+      // 这里只负责“编排”（整理输入、收集输出），算法本体在 engine.js。
+      // 注意它是同步阻塞的——像 C++ 里一个大 for 循环，跑完之前界面不响应点击。
       function run() {
         running.value = true;
         const { net, list } = snapshot();
         const out = [];
         for (let i = 0; i < S.PERIODS; i++) {
-          // 把"主体模板 + 第 i 时段申报"合并为引擎期望的 participants 格式
           const parts = list.map(p => {
             const b = p.bids[i] || {};
             return {
@@ -141,10 +181,11 @@
       }
 
       /* -------- 派生 -------- */
-      // 当前选定时段的出清结果，供顶栏徽章和概览页共用
+      // computed = 带缓存的 getter：依赖（results / state）不变就返回上次结果。
+      // summary 会被很多页面读，若每次读都重算 96 个时段会白费 CPU；
+      // Vue 只在依赖变化后惰性重算一次（≈ memoization）。
       const current = computed(() => results.value[period.value] || null);
 
-      // 全日 96 时段的统计聚合：KPI、主体收支排行、阻塞时段数等
       const summary = computed(() => {
         const rs = results.value.filter(r => r && r.ok);
         if (!rs.length) return null;
@@ -152,14 +193,12 @@
         const prices = rs.map(r => r.price);
         const qty = rs.map(r => r.qty);
         const congestedCount = rs.filter(r => r.congested).length;
-
-        // 各节点全日 LMP 区间（用于"节点电价区间"表）
         const lmpRange = {};
         for (const id of nodes) {
           const vs = rs.map(r => r.lmp[id]).filter(v => v !== undefined);
           lmpRange[id] = { min: Math.min(...vs), max: Math.max(...vs), avg: vs.reduce((a, b) => a + b, 0) / vs.length };
         }
-        // 全日累计：按主体聚合中标量与收支
+        // 全日累计中标与收支
         const genAgg = {}, conAgg = {};
         for (const r of rs) {
           for (const d of r.genDetail) {
@@ -171,7 +210,6 @@
             a.mw += d.awarded; a.amt += d.payment; a.bid += d.bidQty;
           }
         }
-        // 全日总收支与阻塞盈余合计
         const genTotal = Object.values(genAgg).reduce((s, a) => s + a.amt, 0);
         const conTotal = Object.values(conAgg).reduce((s, a) => s + a.amt, 0);
         const rentTotal = rs.reduce((s, r) => s + r.rent, 0);
@@ -189,13 +227,15 @@
           genAgg: Object.values(genAgg), conAgg: Object.values(conAgg),
           genTotal, conTotal, rentTotal, genMw, conMw,
           peakIdx: peak, valleyIdx: valley,
-          infeasible: rs.filter(r => r.infeasible).length,  // 无可行解的时段（再调度无法缓解越限）
-          unmatched: rs.filter(r => !r.matched).length,      // 完全无成交的时段
+          infeasible: rs.filter(r => r.infeasible).length,
+          unmatched: rs.filter(r => !r.matched).length,
         };
       });
 
       /* -------- 持久化 -------- */
-      // 防抖保存：用户连续编辑时不会高频写 localStorage，停止 600ms 后再落盘
+      // watch(state, ...) 监听 state 的任何深层变化（deep: true）。
+      // scheduleSave 用 600ms 定时器“防抖”：连续打字/拖滑块不会立刻写盘，
+      // 停下来 600ms 才落盘一次 —— 类似 C++ 里的“脏标记 + 延迟刷盘”。
       let saveTimer = null;
       function scheduleSave() {
         clearTimeout(saveTimer);
@@ -203,16 +243,18 @@
       }
       watch(state, () => { dirty.value = true; scheduleSave(); }, { deep: true });
 
-      // 2.6 秒自动消失的 toast 提示（同一提示连点会刷新计时器）
+      // flash：弹一条右下角 toast，2.6 秒后自动消失（setTimeout ≈ 一次性定时器回调）。
       function flash(msg) {
         toast.value = msg;
         clearTimeout(flash._t);
         flash._t = setTimeout(() => { toast.value = ''; }, 2600);
       }
 
-      onMounted(() => { run(); });   // 首次进入页面立刻跑一次出清
+      // 页面挂载完成后自动先出清一次，保证首屏就有数据（onMounted ≈ 启动回调）。
+      onMounted(() => { run(); });
 
-      // 暴露给所有子页面的上下文（provide/inject）
+      // 把“共享状态 + 动作”打包成 ctx（≈ 一个上下文对象 / 全局句柄），
+      // provide(CTX, ctx) 之后任意子页面都能 useCtx() 取回它，不用逐层传参。
       const ctx = {
         state, results, period, page, running, dirty, lastRun, toast,
         current, summary, nodeColor,
@@ -223,7 +265,9 @@
     },
 
     template: `
-    <!-- 整体布局：左侧深色导航 + 右侧主区（顶栏 + 内容） -->
+    <!-- 根组件模板只负责“外框”：侧边栏导航 + 顶栏 + 一个内容区。
+         页面细节全部由下面的子组件（<overview-page> 等）各自负责，
+         类似 C++ 里主窗口只摆布局，具体面板拆成独立类。 -->
     <div class="app">
       <aside class="sidebar">
         <div class="brand">
@@ -232,12 +276,12 @@
         </div>
         <nav class="nav">
           <div class="nav-group">分析</div>
-          <!-- 7 个导航项由 setup().data().nav 配置驱动，page 切换 v-if 渲染对应页面 -->
+          <!-- v-for 遍历 data() 里的 nav 数组生成一排导航项：
+               :class 在 page===it.k 时加高亮类，@click 直接改写 page（换页） -->
           <div v-for="it in nav" :key="it.k" class="nav-item" :class="{active:page===it.k}" @click="page=it.k">
             <span class="nav-dot"></span><span>{{it.t}}</span>
           </div>
         </nav>
-        <!-- 侧栏底部：当前场景规模摘要 -->
         <div class="side-foot">
           {{state.network.nodes.length}} 节点 / {{state.network.lines.length}} 线路<br>
           {{state.participants.length}} 个市场主体
@@ -246,8 +290,9 @@
 
       <main class="main">
         <header class="topbar">
-          <!-- 时段切换：prev/next 按钮 + 滑块；+95 %96 与 +1 %96 实现环形跳转 -->
           <div class="period-box">
+            <!-- ‹ › 按钮用 (period±1)%96 实现“上/下一个时段”，到 0 或 95 后循环；
+                 滑块 v-model.number 双向绑定 period —— 拖动即给 period 赋值 -->
             <button class="btn btn-sm" @click="period=(period+95)%96">‹</button>
             <div>
               <div class="period-time">{{timeLabel}}</div>
@@ -257,26 +302,30 @@
             <button class="btn btn-sm" @click="period=(period+1)%96">›</button>
           </div>
 
-          <!-- 网络阻塞开关：关掉则所有时段按统一边际价 SMP 出清（不做 PTDF） -->
           <label class="switch" title="关闭后全网执行统一边际电价，忽略线路容量约束">
+            <!-- checkbox 直接双向绑定 state.network.enabled：
+                 勾选/取消 = 修改引擎的“是否考虑阻塞”开关 -->
             <input type="checkbox" v-model="state.network.enabled">
             考虑网络阻塞
           </label>
 
-          <!-- 当前时段网络状态徽章 -->
+          <!-- 当前时段是否阻塞：由引擎结果 current.congested 决定显示哪个“胶囊”标签 -->
           <span v-if="current && current.congested" class="pill pill-warn">该时段阻塞</span>
           <span v-else-if="current" class="pill pill-ok">该时段畅通</span>
 
           <div class="topbar-spacer"></div>
 
+          <!-- dirty 为 true 显示“数据已修改”；主按钮点击后调用 setup() 里的 run()，
+               running 为 true 时 :disabled 禁用按钮并显示“出清中…” -->
           <span v-if="dirty" class="pill pill-warn">数据已修改</span>
           <button class="btn btn-primary" :disabled="running" @click="run">
             {{running ? '出清中…' : '执行全日出清'}}
           </button>
         </header>
 
-        <!-- 7 个子页面：page === 'xxx' 时渲染对应组件；其余 v-if 移除 -->
         <div class="content">
+          <!-- 内容区“路由”：按 page 的值用 v-if / v-else-if 链切换 7 个子组件，
+               每次只渲染当前页 —— 等价于 switch(page) 后只实例化对应窗口 -->
           <overview-page v-if="page==='overview'"></overview-page>
           <bid-page v-else-if="page==='bid'"></bid-page>
           <curve-page v-else-if="page==='curve'"></curve-page>
@@ -287,12 +336,11 @@
         </div>
       </main>
 
-      <!-- 右下角轻提示：2.6 秒自动消失 -->
+      <!-- toast 全局提示：v-if 控制显隐，内容由 flash() 写入 toast 并自动清空 -->
       <div v-if="toast" style="position:fixed;right:22px;bottom:22px;background:#0f172a;color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;z-index:99">{{toast}}</div>
     </div>`,
 
     data() {
-      // 导航项配置：新增/删除页面时只需改这里与 createApp().component() 两处
       return {
         nav: [
           { k: 'overview', t: '市场总览' },
@@ -310,22 +358,20 @@
     },
   };
 
-  // 各页面统一通过 inject(CTX) 获取根组件上下文
+  // 页面组件都通过 useCtx() 取回根组件 provide 出去的共享上下文（见上方 CTX 的说明）。
   const useCtx = () => inject(CTX);
 
   /* ==================================================================== */
   /*                            市场总览                                    */
   /* ==================================================================== */
-  // 入口页：4 个 KPI（当前时段出清 / 当前时段 SMP / 全日区间 / 阻塞统计）+
-  //        全日出清电价曲线（含峰谷标注）+
-  //        全日中标电量结构（按主体分色堆叠）+
-  //        节点电价区间表 +
-  //        可展开的"算法说明"卡片。
   const OverviewPage = {
     setup() {
       const ctx = useCtx();
       const { state, results, period, current, summary } = ctx;
 
+      // 用 useChart 包装“画图”：括号里的回调在需要重画时才执行，
+      // 返回 ECharts 的 option 配置对象（坐标轴、曲线、提示框等都由此描述）。
+      // 回调里读到的 results/summary/period 一旦变化，Vue 会通过 watch 自动重画。
       const priceChart = useChart(() => {
         const rs = results.value;
         if (!rs.length) return null;
@@ -383,6 +429,8 @@
       const structChart = useChart(() => {
         const sm = summary.value;
         if (!sm) return null;
+        // 结构图：把全日中标电量按主体排序后转成横向条形图；
+        // 生成侧不透明、用电侧半透明（opacity 0.55），一眼能区分两类主体。
         const gen = sm.genAgg.slice().sort((a, b) => b.mw - a.mw);
         const con = sm.conAgg.slice().sort((a, b) => b.mw - a.mw);
         const names = gen.map(g => g.name).concat(con.map(c => c.name));
@@ -564,19 +612,16 @@
   /* ==================================================================== */
   /*                            报价申报                                    */
   /* ==================================================================== */
-  // 主体维度编辑页：左侧主体列表 + 右侧当前时段报价表/曲线。
-  // 支持阶梯 / 二次曲线两种模式，可批量复制到全部 96 时段或高峰时段。
   const BidPage = {
     setup() {
       const ctx = useCtx();
       const { state, period, results } = ctx;
-      const selected = ref(state.participants[0].id);
+      const selected = ref(state.participants[0].id); // 列表中当前点选的主体 id
 
-      // 当前选中主体的模板数据（含全时段报价 bids 数组）
       const cur = computed(() => state.participants.find(p => p.id === selected.value));
-      // 当前时段申报：注意 bids 是按 96 时段索引的二维数组
       const bid = computed(() => cur.value ? (cur.value.bids[period.value] || {}) : {});
-      // 实时校验：调用引擎的 validateBid 把错误列在表单顶部
+      // errs：当前时段报价的“编译期检查”。每次编辑都会重新调用引擎的
+      // E.validateBid()，返回错误字符串数组；模板里 errs.length>0 就显示红条。
       const errs = computed(() => {
         if (!cur.value) return [];
         const b = cur.value.bids[period.value] || {};
@@ -588,7 +633,8 @@
         });
       });
 
-      // 切换阶梯 / 二次曲线：补默认参数以避免空表
+      // 切换 阶梯/二次曲线 报价：若新模式下还没填过数据，就给一组默认参数，
+      // 保证表格/曲线有内容可编辑（类似 C++ 的“默认构造 + 初始化列表”）。
       function setMode(m) {
         const p = cur.value, b = p.bids[period.value];
         b.bidMode = m;
@@ -600,10 +646,9 @@
         }
         ctx.flash('已切换为' + (m === 'step' ? '阶梯' : '二次曲线') + '报价');
       }
-      // 增加一段：新段默认复制上一段参数，方便用户微调
       function addSeg() {
         const b = state.participants.find(p => p.id === selected.value).bids[period.value];
-        if (b.segments.length >= 10) { ctx.flash('最多 10 段'); return; }   // 与引擎校验保持一致
+        if (b.segments.length >= 10) { ctx.flash('最多 10 段'); return; }
         const last = b.segments[b.segments.length - 1] || { power: 100, price: 300 };
         b.segments.push({ power: last.power, price: last.price });
       }
@@ -611,14 +656,12 @@
         const b = state.participants.find(p => p.id === selected.value).bids[period.value];
         b.segments.splice(i, 1);
       }
-      // 把当前时段报价应用到全部 96 时段（深拷贝避免时段间共享对象引用）
       function copyToAll() {
         const p = state.participants.find(x => x.id === selected.value);
         const src = JSON.parse(JSON.stringify(p.bids[period.value]));
         for (let i = 0; i < 96; i++) p.bids[i] = JSON.parse(JSON.stringify(src));
         ctx.flash('已把该时段报价复制到全部 96 个时段');
       }
-      // 仅复制到归一化负荷率 ≥ 0.6 的高峰时段
       function copyToPeak() {
         const p = state.participants.find(x => x.id === selected.value);
         const src = JSON.parse(JSON.stringify(p.bids[period.value]));
@@ -628,7 +671,6 @@
         }
         ctx.flash('已复制到 ' + n + ' 个高峰时段');
       }
-      // 恢复主体的"出厂"报价曲线：从模板重新生成 96 时段
       function resetOne() {
         const p = state.participants.find(x => x.id === selected.value);
         const tpl = S.TEMPLATE.find(t => t.id === p.id);
@@ -637,12 +679,14 @@
         p.bids = S.TEMPLATE ? seedOne(tpl) : p.bids;
         ctx.flash('已重置为默认报价曲线');
       }
-      // 借默认状态播种同一主体的 96 时段报价曲线
       function seedOne(tpl) {
+        // 借默认状态播种同一主体的 96 时段报价曲线
         return S.createDefaultState().participants.find(x => x.id === tpl.id).bids;
       }
 
-      // 二次曲线预览：仅发电侧显示 P-Q 曲线，标注当前出清点 (Q*, P*)
+      // 二次曲线预览
+      // 把 P = a·Q² + b·Q + c 在 [0, qMax] 上取 80 个采样点画成折线，
+      // 再把出清点（中标量, 电价）以散点叠加 —— 采样画函数曲线是数值方法里常见的做法。
       const quadChart = useChart(() => {
         const p = cur.value;
         if (!p || p.side !== 'gen') return null;
@@ -653,7 +697,6 @@
         const N = 80, qm = Math.max(1, +q.qMax || 1);
         for (let i = 0; i <= N; i++) {
           const Q = qm * i / N;
-          // 报价不允许为负，截断在 0
           pts.push([+Q.toFixed(2), +Math.max(0, (+q.a) * Q * Q + (+q.b) * Q + (+q.c)).toFixed(2)]);
         }
         const r = results.value[period.value];
@@ -744,6 +787,8 @@
                   <tbody>
                     <tr v-for="(s,i) in bid.segments" :key="i">
                       <td>{{i+1}}</td>
+                      <!-- v-model.number 双向绑定到 state 里的报价对象：
+                           用户一输入 → 数据立刻被改 → 自动标脏、重跑校验与图表 -->
                       <td><input class="inp-sm" type="number" v-model.number="s.power" step="10" min="0"></td>
                       <td><input class="inp-sm" type="number" v-model.number="s.price" step="10" min="0"></td>
                       <td><button class="btn btn-sm btn-ghost" @click="delSeg(i)">删除</button></td>
@@ -834,17 +879,13 @@
       timeLabel() { return S.periodLabel(this.period); },
     },
     methods: {
-      // 节点 id → 显示名（北区 / 中区 / 南区），由 MarketStore 提供
       nodeName(id) { return S.nodeName(this.state, id); },
-      // 阶梯报价总电力：累加各段增量
       totalPower(b) { return (b.segments || []).reduce((s, x) => s + (+x.power || 0), 0); },
-      // 主体在当前时段的"申报总电力"：阶梯报价求和 / 二次曲线直接取 qMax
       totQty(p) {
         const b = p.bids[this.period] || {};
         if ((b.bidMode || 'step') === 'quadratic') return +(b.quad && b.quad.qMax) || 0;
         return (b.segments || []).reduce((s, x) => s + (+x.power || 0), 0);
       },
-      // 报价区间显示：阶梯 "min → max"，二次曲线 "c → C(qMax)"
       priceRange(p) {
         const b = p.bids[this.period] || {};
         if ((b.bidMode || 'step') === 'quadratic') {
@@ -855,21 +896,18 @@
         if (!ps.length) return '—';
         return this.n0(Math.min(...ps)) + ' → ' + this.n0(Math.max(...ps));
       },
-      // 当前时段中标量：从结果里按主体 id 查
       awardOf(p) {
         const r = this.results[this.period];
         if (!r || !r.ok) return 0;
         const d = (p.side === 'gen' ? r.genDetail : r.conDetail).find(x => x.id === p.id);
         return d ? d.awarded : 0;
       },
-      // 当前时段结算电价：所在节点的 LMP
       priceOf(p) {
         const r = this.results[this.period];
         if (!r || !r.ok) return null;
         const d = (p.side === 'gen' ? r.genDetail : r.conDetail).find(x => x.id === p.id);
         return d ? d.price : null;
       },
-      // 发电侧取收入、用电侧取支出
       amountOf(p) {
         const r = this.results[this.period];
         if (!r || !r.ok) return null;
@@ -883,20 +921,16 @@
   /* ==================================================================== */
   /*                            供需曲线                                    */
   /* ==================================================================== */
-  // 单时段视角下的出清图：阶梯式供需曲线 + 出清点 (Q*, P*) 标记 +
-  //                     节点电价分解表（阻塞时）+ 发/用两侧中标明细 + 线路潮流表
   const CurvePage = {
     setup() {
       const ctx = useCtx();
       const { state, period, results } = ctx;
 
-      // 阶梯式供需曲线 + 出清点：把引擎返回的 stepCurve 数据直接画成 step: 'end' 的折线
       const chart = useChart(() => {
         const r = results.value[period.value];
         if (!r || !r.ok) return null;
-        const sup = (r.supplyCurve || []).map(p => [p[0], p[1]]);   // 供给段累计
-        const dem = (r.demandCurve || []).map(p => [p[0], p[1]]);   // 需求段累计
-        // 自适应坐标轴上限：在最大累计电量上再加 6%，在所有电价上再加 8%
+        const sup = (r.supplyCurve || []).map(p => [p[0], p[1]]);
+        const dem = (r.demandCurve || []).map(p => [p[0], p[1]]);
         const maxQ = Math.max(
           sup.length ? sup[sup.length - 1][0] : 0,
           dem.length ? dem[dem.length - 1][0] : 0) * 1.06 + 10;
@@ -923,14 +957,13 @@
             {
               name: '供应曲线', type: 'line', step: 'end', data: sup, symbol: 'none',
               lineStyle: { width: 2.2, color: C.supply },
-              areaStyle: { color: 'rgba(37,99,235,.08)' },   // 半透明面积仅为视觉提示
+              areaStyle: { color: 'rgba(37,99,235,.08)' },
             },
             {
               name: '需求曲线', type: 'line', step: 'end', data: dem, symbol: 'none',
               lineStyle: { width: 2.2, color: C.demand },
               areaStyle: { color: 'rgba(217,119,6,.08)' },
             },
-            // 第三个系列：单点散点 + 两条参考线，标注 (Q*, P*)
             {
               name: '出清', type: 'scatter', symbolSize: 12, z: 6,
               data: [[r.qty, r.price]],
@@ -1082,6 +1115,9 @@
       </template>
     </div>`,
     computed: {
+      // Options API 风格的 computed：this.r = “当前时段结果”的快捷 getter。
+      // 本文件 setup() 里已有组合式写法，这里的 data/computed/methods 是
+      // 另一种等价写法，Vue 允许混用，模板里对两种写法暴露的东西都能访问。
       r() { return this.results[this.period] || {}; },
       timeLabel() { return S.periodLabel(this.period); },
       sumGenMw() { return (this.r.genDetail || []).reduce((s, d) => s + d.awarded, 0); },
@@ -1103,13 +1139,11 @@
   /* ==================================================================== */
   /*                          电价与阻塞                                    */
   /* ==================================================================== */
-  // 全日 96 时段视角下的电价分析：热力气泡图 + LMP 走势 + LMP 构成分解 + 线路潮流 + PTDF 矩阵
   const PricePage = {
     setup() {
       const ctx = useCtx();
       const { state, results, period, summary } = ctx;
 
-      // 节点电价 LMP 走势：每个节点一条线；如启用网络约束，再叠加一条 SMP 虚线
       const lmpChart = useChart(() => {
         const rs = results.value;
         if (!rs.length) return null;
@@ -1149,21 +1183,21 @@
         };
       });
 
-      // LMP 构成分解：堆叠柱状图 —— 灰色基座是能量分量 λ，彩色是各节点的阻塞分量
       const stackChart = useChart(() => {
         const rs = results.value;
         if (!rs.length) return null;
         const labels = []; for (let i = 0; i < 96; i++) labels.push(S.periodLabel(i));
+        // 以第一个节点的能量分量作为基准，展示 LMP 的构成
         const energy = rs.map(r => r && r.ok ? +Math.max(0, r.energy).toFixed(2) : 0);
         const series = [{
           name: '能量分量 λ', type: 'bar', stack: 'lmp', data: energy,
           itemStyle: { color: '#94a3b8' }, barWidth: '72%',
         }];
+        // 阻塞分量：按节点展示最大最小值区间（用 LMP_max - λ 表示上界增量）
         const nodes = state.network.nodes;
         nodes.forEach((n, i) => {
           series.push({
             name: '阻塞分量 · ' + n.name, type: 'bar', stack: 'lmp',
-            // 阻塞分量可能为负（送端），堆叠图仅显示绝对值高度，颜色提示正负
             data: rs.map(r => r && r.ok && r.lmp[n.id] !== undefined
               ? +Math.max(0, r.lmp[n.id] - r.energy).toFixed(2) : 0),
             itemStyle: { color: C.node[i % C.node.length], opacity: .85 },
@@ -1179,7 +1213,6 @@
         };
       });
 
-      // 线路潮流：每条线路一条 |f| 折线，红色点线标容量
       const flowChart = useChart(() => {
         const rs = results.value;
         if (!rs.length) return null;
@@ -1310,49 +1343,41 @@
   /* ==================================================================== */
   /*                            结算校验                                    */
   /* ==================================================================== */
-  // 全日累计结算与一致性校验：4 个 KPI + 5 项校验清单 + 主体收支排行 + 资金流向展示
   const SettlePage = {
     setup() {
       const ctx = useCtx();
       const { state, results, summary } = ctx;
 
-      // 5 项一致性自检 —— 任何一项不通过都说明 LMP/再调度计算有 bug
+      // checks：把“结算正确性自检”写成一组 {name, ok, detail} 断言。
+      // 每个 ok 都是一条布尔命题（电量守恒、资金守恒、阻塞盈余非负…），
+      // 模板据此画 ✓ / ! —— 相当于把单测断言直接搬进界面，
+      // 改完网络参数或报价，立刻就能看到哪条守恒性质被破坏。
       const checks = computed(() => {
         const sm = summary.value;
         if (!sm) return [];
         const out = [];
-
-        // 1. 电量守恒：发电中标 = 用电中标（必有等量成交）
         const diff = Math.abs(sm.genMw - sm.conMw);
         out.push({
           name: '电量守恒：发电侧中标总量 = 用电侧中标总量',
           ok: diff < 1e-3, detail: '差额 ' + nf(diff, 4) + ' MW',
         });
-
-        // 2. 资金守恒：用电支出 = 发电收入 + 阻塞盈余
         const balDiff = Math.abs(sm.conTotal - sm.genTotal - sm.rentTotal);
         out.push({
           name: '资金守恒：用电支出 = 发电收入 + 阻塞盈余',
           ok: balDiff < Math.max(1, sm.conTotal * 1e-6),
           detail: '差额 ' + nf(balDiff, 2) + ' 元',
         });
-
-        // 3. 阻塞盈余非负：LMP 结算理论性质，若出现负值则说明计算有误
         const minRent = Math.min(...results.value.filter(r => r && r.ok).map(r => r.rent));
         out.push({
           name: '阻塞盈余非负（LMP 结算的理论性质）',
           ok: minRent > -0.05, detail: '单时段最小值 ' + nf(minRent, 2) + ' 元',
         });
-
-        // 4. 中标量不超过申报量：所有主体的 awarded ≤ bidQty
         const over = results.value.filter(r => r && r.ok)
           .some(r => r.genDetail.concat(r.conDetail).some(d => d.awarded > d.bidQty + 1e-6));
         out.push({
           name: '中标量不超过申报量',
           ok: !over, detail: over ? '存在超申报中标' : '全部时段通过',
         });
-
-        // 5. 出清有效性：不存在"无成交"或"无可行解"的时段
         out.push({
           name: '出清有效性：不存在无成交或无可行解时段',
           ok: sm.unmatched === 0 && sm.infeasible === 0,
@@ -1361,7 +1386,6 @@
         return out;
       });
 
-      // 主体收支排行柱状图：横向条形按金额排序，发电蓝 / 用电橙
       const chart = useChart(() => {
         const sm = summary.value;
         if (!sm) return null;
@@ -1517,16 +1541,17 @@
   /* ==================================================================== */
   /*                            网络参数                                    */
   /* ==================================================================== */
-  // 电网拓扑编辑页：网络约束开关、平衡节点选择、节点列表、线路编辑
   const NetworkPage = {
     setup() {
       const ctx = useCtx();
       const { state, period } = ctx;
-      // 在两端默认节点之间追加一条新线路
+      // 新增/删除线路 = 直接 push / splice 响应式数组 state.network.lines：
+      // Vue 会自动增删表格行，无需像 C++ 里手动重建列表控件。
+      // id 里拼了 Date.now() 的时间戳，避免快速连点时撞 id。
       function addLine() {
         const ns = state.network.nodes;
         state.network.lines.push({
-          id: 'L' + (state.network.lines.length + 1) + '_' + Date.now().toString(36),   // 加时间戳避免重复 id
+          id: 'L' + (state.network.lines.length + 1) + '_' + Date.now().toString(36),
           name: '新增线路', from: ns[0].id, to: ns[ns.length - 1].id, x: 0.1, cap: 300,
         });
       }
@@ -1616,8 +1641,6 @@
       </div>
     </div>`,
     methods: {
-      // 节点在某侧的"申报总电力"：累加该节点所有主体在该时段的申报量
-      // 二次曲线取 qMax，阶梯报价取 segments.power 之和
       capAt(id, side) {
         let t = 0;
         const per = this.period;
@@ -1636,18 +1659,20 @@
   /* ==================================================================== */
   /*                            数据管理                                    */
   /* ==================================================================== */
-  // 方案存档、读档、结果导出、恢复默认、清空缓存
   const DataPage = {
     setup() {
       const ctx = useCtx();
       const { state, results } = ctx;
       const fileRef = ref(null);
 
-      // 导出方案 JSON（含全部 96 时段报价）
+      // 导出方案：深拷贝后交给 store 层序列化为 JSON 并触发浏览器下载
+      // （为什么深拷贝：state 是 Vue 代理，直接交给序列化/引擎会带上代理副作用）。
       function doExport() { S.exportJSON(JSON.parse(JSON.stringify(state))); ctx.flash('方案已导出'); }
-      // 触发隐藏的 <input type="file"> 点击
       function pickFile() { fileRef.value && fileRef.value.click(); }
-      // 读 JSON 文件 → 校验 → 替换 state → 重新出清
+      // 导入方案：FileReader 异步读完文件 → S.deserialize 校验格式 →
+      // 把 s 的顶层字段逐个赋回 state。
+      // 不写 state = s 的原因：state 是 reactive 代理，整体换引用会断开所有
+      // 模板/watch 对它的追踪，必须原地替换字段才能继续自动响应。
       function onFile(e) {
         const f = e.target.files && e.target.files[0];
         if (!f) return;
@@ -1666,10 +1691,8 @@
           }
         };
         rd.readAsText(f, 'utf-8');
-        // 清空 value 以便下次能再次选同名文件
         e.target.value = '';
       }
-      // 恢复为默认演示场景（不删 localStorage，仅替换当前 state）
       function doReset() {
         if (!confirm('确定要恢复为默认演示场景吗？当前的全部报价修改将丢失。')) return;
         const d = S.createDefaultState();
@@ -1680,7 +1703,6 @@
         ctx.run();
         ctx.flash('已恢复默认场景');
       }
-      // 清空 localStorage（仅缓存，不影响当前已加载 state）
       function clearCache() {
         if (!confirm('确定清空本地缓存吗？下次打开将回到默认场景。')) return;
         S.clear();
@@ -1755,19 +1777,15 @@
       </div>
     </div>`,
     computed: {
-      // 发电主体数（用于"当前数据集"展示）
       genCount() { return this.state.participants.filter(p => p.side === 'gen').length; },
-      // 用电主体数
       conCount() { return this.state.participants.filter(p => p.side === 'con').length; },
     },
     methods: {
-      // 导出"出清结果 CSV"：按时段 × 节点 × 线路展开，含 BOM 防 Excel 乱码
       exportCsv() {
         if (!this.results.length) { this.ctx.flash('请先执行出清'); return; }
         S.exportCSV(JSON.parse(JSON.stringify(this.state)), this.results);
         this.ctx.flash('出清结果已导出');
       },
-      // 导出"中标明细 CSV"：按时段 × 主体展开，包含申报量、中标量、电价、金额
       exportAward() {
         if (!this.results.length) { this.ctx.flash('请先执行出清'); return; }
         S.exportAwardCSV(JSON.parse(JSON.stringify(this.state)), this.results);
@@ -1777,7 +1795,12 @@
   };
 
   /* ---------------------------------------------------------------- 挂载 */
-  // 注册 7 个页面组件并挂载到 #app
+  // 启动应用的“最后一公里”：
+  //   createApp(App)               ≈ 构造根应用对象（主窗口）；
+  //   .component('x-page', XPage)  ≈ 把各页面组件注册为模板里可用的标签，
+  //                                  注册后 <overview-page> 这类写法才能被识别；
+  //   .mount('#app')               ≈ 把整个界面渲染进 index.html 里 id="app" 的空 div
+  //                                  （相当于 show() 主窗口，真正的内容由 Vue 生成）。
   createApp(App)
     .component('overview-page', OverviewPage)
     .component('bid-page', BidPage)
